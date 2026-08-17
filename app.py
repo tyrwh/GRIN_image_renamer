@@ -2,6 +2,7 @@ import os
 import tempfile
 import shutil
 import time
+import re
 import zxing
 import gradio as gr
 import pandas as pd
@@ -68,7 +69,7 @@ def run_pipeline(df, progress=gr.Progress(track_tqdm=False)):
                 x1,y1,x2,y2 = list(box.xyxy.numpy()[0])
                 qr_crop = img.crop((x1-pad,y1-pad,x2+pad,y2+pad))
                 zxing_results = reader.decode(qr_crop)
-                if zxing_results.parsed:
+                if zxing_results and zxing_results.parsed:
                     parse_count += 1
                     parser_results.append(zxing_results.parsed)
         if len(parser_results) > 0:
@@ -83,6 +84,82 @@ def run_pipeline(df, progress=gr.Progress(track_tqdm=False)):
     df["New filename"] = parsed_text
     gr.Info("Pipeline finished!")
     return df
+
+def _format_name_from_qr(raw_text, separator):
+    """Split QR text on spaces and join with user-selected separator."""
+    if raw_text is None:
+        return ""
+    text = str(raw_text).strip()
+    if not text:
+        return ""
+    parts = [p for p in text.split(" ") if p]
+    joined = separator.join(parts).strip()
+    # Keep names filesystem-safe.
+    return re.sub(r"[\\/:*?\"<>|]+", "", joined).strip(" .")
+
+
+def _dedupe_filename(filename, used_names):
+    """Ensure duplicate names are made unique with a numeric suffix."""
+    stem, ext = os.path.splitext(filename)
+    candidate = filename
+    counter = 2
+    while candidate in used_names:
+        candidate = f"{stem}_{counter}{ext}"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def download_renamed(df, separator, include_mode):
+    if df is None or df.empty:
+        gr.Warning("No files are available to download.")
+        return None
+
+    sep = separator if separator not in (None, "") else "_"
+    include_unparsed = include_mode == "Include images with no parsed QR"
+
+    run_dir = tempfile.mkdtemp(prefix="grin_renamed_")
+    renamed_dir = os.path.join(run_dir, "renamed_images")
+    os.makedirs(renamed_dir, exist_ok=True)
+
+    copied = 0
+    skipped = 0
+    used_names = set()
+
+    for _, row in df.iterrows():
+        original = str(row.get("Original filename", "")).strip()
+        if not original:
+            continue
+
+        source = os.path.join(UPLOAD_DIR, original)
+        if not os.path.exists(source):
+            continue
+
+        new_name_raw = row.get("New filename", "")
+        if pd.isna(new_name_raw):
+            new_name_raw = ""
+
+        stem, ext = os.path.splitext(original)
+        renamed_stem = _format_name_from_qr(new_name_raw, sep)
+
+        if not renamed_stem:
+            if not include_unparsed:
+                skipped += 1
+                continue
+            renamed_stem = stem
+
+        final_name = _dedupe_filename(f"{renamed_stem}{ext}", used_names)
+        destination = os.path.join(renamed_dir, final_name)
+        shutil.copy2(source, destination)
+        copied += 1
+
+    if copied == 0:
+        gr.Warning("No files matched your download settings.")
+        return None
+
+    zip_path = shutil.make_archive(os.path.join(run_dir, "renamed_images"), "zip", renamed_dir)
+    gr.Info(f"Prepared {copied} file(s) for download ({skipped} skipped).")
+    return gr.update(value=zip_path, visible=True)
 
 
 with gr.Blocks(title="GRIN Image Renamer") as demo:
@@ -119,6 +196,20 @@ with gr.Blocks(title="GRIN Image Renamer") as demo:
             )
             upload_count = gr.Markdown("### 0 image(s) uploaded")
             run_btn = gr.Button("Run Pipeline", variant="primary")
+        with gr.Column(scale=3):
+            gr.Markdown("### Download settings")
+            separator = gr.Textbox(label="Separator", value="_", max_lines=1)
+            include_unparsed = gr.Radio(
+                choices=[
+                    "Include images with no parsed QR",
+                    "Exclude images with no parsed QR",
+                ],
+                value="Include images with no parsed QR",
+                label="Unparsed images",
+            )
+            prepare_btn = gr.Button("Prepare Download", variant="secondary")
+            download_btn = gr.DownloadButton("Download renamed images", visible=False)
+
     with gr.Row(max_height=600):
         with gr.Column(scale=1):
             table = gr.Dataframe(
@@ -148,6 +239,12 @@ with gr.Blocks(title="GRIN Image Renamer") as demo:
         fn=run_pipeline,
         inputs=[table],
         outputs=[table],
+    )
+
+    prepare_btn.click(
+        fn=download_renamed,
+        inputs=[table, separator, include_unparsed],
+        outputs=[download_btn],
     )
 
 
