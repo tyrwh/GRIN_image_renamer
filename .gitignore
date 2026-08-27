@@ -1,0 +1,4 @@
+.DS_Store
+.gradio/
+__marimo__/
+__pycache__/

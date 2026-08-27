@@ -1,7 +1,6 @@
 import os
 import tempfile
 import shutil
-import time
 import re
 import zxing
 import gradio as gr
