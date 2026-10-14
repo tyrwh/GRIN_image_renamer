@@ -8,16 +8,74 @@ import pandas as pd
 from PIL import Image
 from ultralytics import YOLO
 
-MODEL = YOLO("qr_yolo26m_0.pt")
-reader = zxing.BarCodeReader()
+
+if gr.NO_RELOAD:
+    MODEL = YOLO("qr_yolo26m_0.pt")
+    reader = zxing.BarCodeReader()
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix="grin_uploads_")
+
+css = """
+.vertical-radio .wrap { flex-direction: column; }
+.vertical-radio [data-testid="block-info"] { font-size: 1.5rem; }
+.label-wrap span { font-size: 1.8rem; }
+.spaced { margin-top: 2.5rem; }
+.large-label [data-testid="block-info"] { font-size: 1.5rem; }
+"""
+
+bi_theme = gr.themes.Default(
+    font=gr.themes.GoogleFont("Lato"),
+    primary_hue="teal",
+    text_size="lg",
+    )
+
+# create a separator dictionary that we can reuse, instead of 
+SEPARATORS = [{"string":"_",
+               "label":"Underscore ( _ )"},
+               {"string":"-",
+               "label":"Hyphen ( - )"},
+               {"string":" ",
+               "label":"Space (   )"},
+               {"string":"",
+                "label":"None"},
+               {"string":"custom",
+               "label":"Custom"}]
+
+KEEP_EXTENSION = "Keep existing extensions"
+EXTENSIONS = [".jpg", ".JPG", ".jpeg", ".JPEG", ".png", ".PNG"]
+PIL_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG"}
+
+def toggle_custom(choice):
+    return gr.Textbox(visible=(choice == "Custom"))
+
+
+def toggle_custom_sep(index):
+    return gr.Textbox(visible=(index is not None and SEPARATORS[index]["label"] == "Custom"))
+
+
+def _resolve_affix(choice, custom_text, original_stem):
+    """Return the prefix/suffix string for the selected Radio option."""
+    if choice == "Custom":
+        return custom_text or ""
+    if choice == "Current filename":
+        return original_stem
+    return ""
+
+
+def _resolve_separator(index, custom_text):
+    if index is None:
+        return "_"
+    entry = SEPARATORS[index]
+    if entry["label"] == "Custom":
+        return custom_text or ""
+    return entry["string"]
+
 
 def handle_upload(files):
     """Copy uploaded files to temp dir; return dataframe + first image preview."""
     empty_df = pd.DataFrame(columns=["Original filename", "QRs\ndetected", "QRs\nparsed", "New filename"])
     if not files:
-        return empty_df, None, None, "### 0 image(s) uploaded"
+        return empty_df, None, None, "### 0 image(s) uploaded", {}
 
     rows = []
     for f in sorted(files, key=lambda x: os.path.basename(x)):
@@ -29,7 +87,7 @@ def handle_upload(files):
     df = pd.DataFrame(rows)
     first_image = Image.open(os.path.join(UPLOAD_DIR, df.iloc[0]["Original filename"]))
     count_text = f"### {len(df)} image(s) uploaded"
-    return df, first_image, None, count_text
+    return df, first_image, None, count_text, {}
 
 
 def preview_selected(evt: gr.SelectData, df):
@@ -43,11 +101,13 @@ def preview_selected(evt: gr.SelectData, df):
         return Image.open(path)
     return None
 
-def run_pipeline(df, progress=gr.Progress(track_tqdm=False)):
+
+def run_pipeline(df, prefix_choice, custom_prefix, sep_index, custom_sep, suffix_choice, custom_suffix,
+                 extension_choice, progress=gr.Progress(track_tqdm=False)):
     """Run YOLO detection on each uploaded image and count aztec_code hits."""
     if df is None or df.empty:
         gr.Info("No images to process. Upload images first.")
-        return df
+        return df, {}
 
     filenames = df["Original filename"].tolist()
     qr_counts = []
@@ -80,9 +140,12 @@ def run_pipeline(df, progress=gr.Progress(track_tqdm=False)):
         parsed_text.append(text)
     df["QRs\ndetected"] = qr_counts
     df["QRs\nparsed"] = parsed_qr_counts
-    df["New filename"] = parsed_text
+    raw_qr = dict(zip(filenames, parsed_text))
+    df = update_filenames(df, raw_qr, prefix_choice, custom_prefix, sep_index, custom_sep,
+                          suffix_choice, custom_suffix, extension_choice)
     gr.Info("Pipeline finished!")
-    return df
+    return df, raw_qr
+
 
 def _format_name_from_qr(raw_text, separator):
     """Split QR text on spaces and join with user-selected separator."""
@@ -97,6 +160,35 @@ def _format_name_from_qr(raw_text, separator):
     return re.sub(r"[\\/:*?\"<>|]+", "", joined).strip(" .")
 
 
+def _build_new_name(raw_text, original, prefix_choice, custom_prefix, sep, suffix_choice, custom_suffix,
+                    extension_choice):
+    body = _format_name_from_qr(raw_text, sep)
+    if not body:
+        return ""
+    stem, original_ext = os.path.splitext(original)
+    name = (_resolve_affix(prefix_choice, custom_prefix, stem)
+            + body
+            + _resolve_affix(suffix_choice, custom_suffix, stem))
+    name = re.sub(r"[\\/:*?\"<>|]+", "", name).strip(" .")
+    ext = extension_choice if extension_choice in EXTENSIONS else original_ext
+    return f"{name}{ext}"
+
+
+def update_filenames(df, raw_qr, prefix_choice, custom_prefix, sep_index, custom_sep,
+                     suffix_choice, custom_suffix, extension_choice):
+    """Rebuild the New filename column from the raw QR text and current settings."""
+    if df is None or df.empty:
+        return df
+    raw_qr = raw_qr or {}
+    sep = _resolve_separator(sep_index, custom_sep)
+    df["New filename"] = [
+        _build_new_name(raw_qr.get(f, ""), f, prefix_choice, custom_prefix, sep,
+                        suffix_choice, custom_suffix, extension_choice)
+        for f in df["Original filename"]
+    ]
+    return df
+
+
 def _dedupe_filename(filename, used_names):
     """Ensure duplicate names are made unique with a numeric suffix."""
     stem, ext = os.path.splitext(filename)
@@ -109,13 +201,17 @@ def _dedupe_filename(filename, used_names):
     return candidate
 
 
-def download_renamed(df, separator, include_mode):
+def download_renamed(df, include_mode, zip_name):
     if df is None or df.empty:
         gr.Warning("No files are available to download.")
         return None
 
-    sep = separator if separator not in (None, "") else "_"
     include_unparsed = include_mode == "Include images with no parsed QR"
+
+    zip_stem = str(zip_name or "").strip()
+    if zip_stem.lower().endswith(".zip"):
+        zip_stem = zip_stem[:-4]
+    zip_stem = re.sub(r"[\\/:*?\"<>|]+", "", zip_stem).strip(" .") or "renamed_images"
 
     run_dir = tempfile.mkdtemp(prefix="grin_renamed_")
     renamed_dir = os.path.join(run_dir, "renamed_images")
@@ -138,94 +234,188 @@ def download_renamed(df, separator, include_mode):
         if pd.isna(new_name_raw):
             new_name_raw = ""
 
-        stem, ext = os.path.splitext(original)
-        renamed_stem = _format_name_from_qr(new_name_raw, sep)
+        ext = os.path.splitext(original)[1]
+        new_name = re.sub(r"[\\/:*?\"<>|]+", "", str(new_name_raw)).strip(" .")
 
-        if not renamed_stem:
+        if not new_name:
             if not include_unparsed:
                 skipped += 1
                 continue
-            renamed_stem = stem
+            new_name = original
+        elif os.path.splitext(new_name)[1] not in EXTENSIONS:
+            # Append rather than replace, so dots in QR text aren't treated as extensions.
+            new_name = f"{new_name}{ext}"
 
-        final_name = _dedupe_filename(f"{renamed_stem}{ext}", used_names)
+        final_name = _dedupe_filename(new_name, used_names)
         destination = os.path.join(renamed_dir, final_name)
-        shutil.copy2(source, destination)
+        target_format = PIL_FORMATS.get(os.path.splitext(final_name)[1].lower())
+        with Image.open(source) as img:
+            if target_format is None or img.format == target_format:
+                shutil.copy2(source, destination)
+            else:
+                save_kwargs = {}
+                if "exif" in img.info:
+                    save_kwargs["exif"] = img.info["exif"]
+                if target_format == "JPEG":
+                    img = img.convert("RGB")
+                    save_kwargs["quality"] = 95
+                img.save(destination, format=target_format, **save_kwargs)
         copied += 1
 
     if copied == 0:
         gr.Warning("No files matched your download settings.")
         return None
 
-    zip_path = shutil.make_archive(os.path.join(run_dir, "renamed_images"), "zip", renamed_dir)
+    zip_path = shutil.make_archive(os.path.join(run_dir, zip_stem), "zip", renamed_dir)
     gr.Info(f"Prepared {copied} file(s) for download ({skipped} skipped).")
     return gr.update(value=zip_path, visible=True)
 
 
-with gr.Blocks(title="GRIN Image Renamer") as demo:
+with gr.Blocks(title="QR Image Renamer") as demo:
+    raw_qr = gr.State({})
     with gr.Row():
-        with gr.Column(scale=3):
-            gr.Markdown(
-                """
-                # GRIN Image Renamer
-
-                This is a minimal app to rename images using information scraped from
-                QR / Aztec codes detected in the image.
-                
-                Simply select images to upload, then click **Run Pipeline** to process them.
-                After the pipeline has run, you can inspect the new image names and make any 
-                necessary changes before downloading the renamed versions.
-
-                *Note*: If you are running this app on your local computer via Docker Desktop,
-                then the images are not uploaded to a web server of any kind. They are simply
-                "uploaded" to a temporary storage location on your machine until the app is shut
-                down.
-
-                This app was written by Tyr Wiesner-Hanks of Breeding Insight, a USDA-funded
-                initiative based at University of Florida. If you have any questions or feedback,
-                please email me at [twiesnerhanks@ufl.edu](mailto:twiesnerhanks@ufl.edu).                
-                """,
-                container=True
-            )
+        gr.Markdown("# Breeding Insight QR Image Renamer ")
+    with gr.Row(elem_classes="spaced"): # Instructions + upload section?
         with gr.Column(scale=2):
             upload = gr.File(
-                label="Upload images",
                 file_count="multiple",
                 file_types=["image"],
                 type="filepath",
+                show_label=False,
             )
             upload_count = gr.Markdown("### 0 image(s) uploaded")
-            run_btn = gr.Button("Run Pipeline", variant="primary")
-        with gr.Column(scale=3):
-            gr.Markdown("### Download settings")
-            separator = gr.Textbox(label="Separator", value="_", max_lines=1)
-            include_unparsed = gr.Radio(
-                choices=[
-                    "Include images with no parsed QR",
-                    "Exclude images with no parsed QR",
-                ],
-                value="Include images with no parsed QR",
-                label="Unparsed images",
-            )
-            prepare_btn = gr.Button("Prepare Download", variant="secondary")
-            download_btn = gr.DownloadButton("Download renamed images", visible=False)
+            run_btn = gr.Button("Start Detection", variant="primary")
+        with gr.Column(scale=5):
+            gr.Markdown( 
+                """
+                ### INSTRUCTIONS
+                1. Select a set of images to upload and hit **Start Detection** to begin the
+                QR detection and reading process.
+                2. Choose your settings for how to construct filenames using the text scraped
+                from the detected QR code.
+                3. Use the filename table to make any manual corrections or additions to the
+                final filenames. To view an image, click anywhere on its corresponding row.
+                4. When ready, hit **Prepare Download** to generate a `.zip` of the renamed images,
+                then hit **Download Renamed Images** to save them to your computer.
 
-    with gr.Row(max_height=600):
-        with gr.Column(scale=1):
+                ### INFO
+                This app was created by [Breeding Insight](https://breedinginsight.org/),
+                a USDA-funded initiative based at University of Florida. It is licensed under the open-source
+                [Apache 2.0 License](https://www.apache.org/licenses/LICENSE-2.0.txt).
+
+                To run this app locally or on your own web server, or to fork the project to modify
+                it to fit your own program's needs, please visit the app's
+                [Github page](https://github.com/tyrwh/GRIN_image_renamer).
+
+                Any images uploaded here are saved to temporary storage on . All machine learning
+                steps are performed with a custom-trained QR code detection model; images are not
+                uploaded to any AI API 
+
+                For any questions or feedback,
+                please email me at [twiesnerhanks@ufl.edu](mailto:twiesnerhanks@ufl.edu).
+                
+                """,
+                container=True
+            )
+
+    with gr.Accordion(label="Settings", elem_classes="spaced"): # Settings dropdown
+        with gr.Row():
+            with gr.Column(scale=1):
+                prefix = gr.Radio(
+                    choices=[
+                        "None",
+                        "Current filename",
+                        "Custom",
+                    ],
+                    value="None",
+                    label="Prefix",
+                    info="Insert a prefix at the start of each filename.",
+                    elem_classes="vertical-radio"
+                )
+                custom_prefix = gr.Textbox(visible=False,
+                                        label="Custom prefix to use:")
+                prefix.change(toggle_custom, prefix, custom_prefix)
+            with gr.Column(scale=1):
+                separator = gr.Radio(
+                    label="Separator",
+                    info="Character(s) to use when rejoining the elements of the QR text.",
+                    choices=[x["label"] for x in SEPARATORS],
+                    value=SEPARATORS[0]["label"],
+                    type="index",
+                    elem_classes="vertical-radio"
+                    )
+                custom_sep = gr.Textbox(visible=False,
+                                        label="Custom separator to use:")
+                separator.change(toggle_custom_sep, separator, custom_sep)
+            with gr.Column(scale=1):
+                suffix = gr.Radio(
+                    choices=[
+                        "None",
+                        "Current filename",
+                        "Custom",
+                    ],
+                    value="None",
+                    label="Suffix",
+                    info="Append a suffix at the end of each filename.",
+                    elem_classes="vertical-radio"
+                )
+                custom_suffix = gr.Textbox(visible=False,
+                                        label="Custom suffix to use:")
+                suffix.change(toggle_custom, suffix, custom_suffix)
+            with gr.Column(scale=1):
+                extension = gr.Radio(
+                    choices=[KEEP_EXTENSION] + EXTENSIONS,
+                    value=KEEP_EXTENSION,
+                    label="Extension",
+                    info="Filename extension to apply to all images.",
+                    elem_classes="vertical-radio",
+                )
+        with gr.Row():
+            update_btn = gr.Button(
+                "Update filenames with current settings",
+                variant="secondary",
+                )
+    with gr.Row(max_height=600, elem_classes="spaced"): # Table and image viewer
+        with gr.Column(scale=3):
             table = gr.Dataframe(
-                headers=["Original filename", "QRs\ndetected", "QRs\nparsed", "New filename"],
+                headers=["Original filename", "QRs detected", "QRs parsed", "New filename"],
                 datatype=["str", "number", "number", "str"],
                 interactive=True,
                 max_height=550,
                 column_widths=["40%","10%","10%","40%"]
             )
-        with gr.Column(scale=1):
+        with gr.Column(scale=2):
             preview = gr.Image(label="Image preview", type="pil")
+    with gr.Accordion(label="Download", elem_classes="spaced"): # Settings dropdown
+        with gr.Row():
+            with gr.Column():                 
+                include_unparsed = gr.Radio(
+                    label="Unreadable QRs",
+                    info="Should images with no detectable or readable QR code be included (with their original filename) in the final download?",
+                    choices=[
+                        "Include images with no parsed QR",
+                        "Remove images with no parsed QR",
+                    ],
+                    value="Include images with no parsed QR",
+                    elem_classes="vertical-radio",
+                )
+            with gr.Column():
+                download_zip_name = gr.Textbox(
+                    label="Output .zip name",
+                    info="Filename to use for the final .zip file of renamed images.",
+                    placeholder="renamed_images",
+                    type="text",
+                    elem_classes="large-label",
+                )
+            with gr.Column():
+                prepare_btn = gr.Button("Prepare Download", variant="secondary")
+                download_btn = gr.DownloadButton("Download Renamed Images", visible=False)
 
     # --- wiring ---
     upload.upload(
         fn=handle_upload,
         inputs=[upload],
-        outputs=[table, preview, upload, upload_count],
+        outputs=[table, preview, upload, upload_count, raw_qr],
     )
 
     table.select(
@@ -234,18 +424,29 @@ with gr.Blocks(title="GRIN Image Renamer") as demo:
         outputs=[preview],
     )
 
+    naming_inputs = [prefix, custom_prefix, separator, custom_sep, suffix, custom_suffix, extension]
+
     run_btn.click(
         fn=run_pipeline,
-        inputs=[table],
+        inputs=[table] + naming_inputs,
+        outputs=[table, raw_qr],
+    )
+
+    update_btn.click(
+        fn=update_filenames,
+        inputs=[table, raw_qr] + naming_inputs,
         outputs=[table],
     )
 
     prepare_btn.click(
         fn=download_renamed,
-        inputs=[table, separator, include_unparsed],
+        inputs=[table, include_unparsed, download_zip_name],
         outputs=[download_btn],
     )
 
 
 if __name__ == "__main__":
-    demo.launch(server_name="0.0.0.0", server_port=7860)
+    demo.launch(server_name="0.0.0.0",
+                server_port=8080,
+                css=css,
+                theme=bi_theme)
