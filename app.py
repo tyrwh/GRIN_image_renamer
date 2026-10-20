@@ -21,6 +21,15 @@ css = """
 .label-wrap span { font-size: 1.8rem; }
 .spaced { margin-top: 2.5rem; }
 .large-label [data-testid="block-info"] { font-size: 1.5rem; }
+#detect-progress .progress-bar-wrap { height: 1.5rem; }
+#detect-progress .progress-level-inner { margin: 0.75rem auto; }
+#detect-progress .meta-text,
+#detect-progress .meta-text-center {
+    position: static;
+    transform: none;
+    order: 1;
+    margin-top: 0.5rem;
+}
 """
 
 bi_theme = gr.themes.Default(
@@ -62,9 +71,9 @@ def _resolve_affix(choice, custom_text, original_stem):
     return ""
 
 
-def _resolve_separator(index, custom_text):
+def _resolve_separator(index, custom_text, default="_"):
     if index is None:
-        return "_"
+        return default
     entry = SEPARATORS[index]
     if entry["label"] == "Custom":
         return custom_text or ""
@@ -102,8 +111,8 @@ def preview_selected(evt: gr.SelectData, df):
     return None
 
 
-def run_pipeline(df, prefix_choice, custom_prefix, sep_index, custom_sep, suffix_choice, custom_suffix,
-                 extension_choice, progress=gr.Progress(track_tqdm=False)):
+def run_pipeline(df, prefix_choice, custom_prefix, split_index, custom_split, sep_index, custom_sep,
+                 suffix_choice, custom_suffix, extension_choice, progress=gr.Progress(track_tqdm=False)):
     """Run YOLO detection on each uploaded image and count aztec_code hits."""
     if df is None or df.empty:
         gr.Info("No images to process. Upload images first.")
@@ -141,28 +150,29 @@ def run_pipeline(df, prefix_choice, custom_prefix, sep_index, custom_sep, suffix
     df["QRs\ndetected"] = qr_counts
     df["QRs\nparsed"] = parsed_qr_counts
     raw_qr = dict(zip(filenames, parsed_text))
-    df = update_filenames(df, raw_qr, prefix_choice, custom_prefix, sep_index, custom_sep,
-                          suffix_choice, custom_suffix, extension_choice)
+    df = update_filenames(df, raw_qr, prefix_choice, custom_prefix, split_index, custom_split,
+                          sep_index, custom_sep, suffix_choice, custom_suffix, extension_choice)
     gr.Info("Pipeline finished!")
     return df, raw_qr
 
 
-def _format_name_from_qr(raw_text, separator):
-    """Split QR text on spaces and join with user-selected separator."""
+def _format_name_from_qr(raw_text, splitchar, separator):
+    """Split QR text on the user-selected split string and join with user-selected separator."""
     if raw_text is None:
         return ""
     text = str(raw_text).strip()
     if not text:
         return ""
-    parts = [p for p in text.split(" ") if p]
+    # An empty split string (the "None" option) means don't split at all.
+    parts = [p for p in text.split(splitchar) if p] if splitchar else [text]
     joined = separator.join(parts).strip()
     # Keep names filesystem-safe.
     return re.sub(r"[\\/:*?\"<>|]+", "", joined).strip(" .")
 
 
-def _build_new_name(raw_text, original, prefix_choice, custom_prefix, sep, suffix_choice, custom_suffix,
-                    extension_choice):
-    body = _format_name_from_qr(raw_text, sep)
+def _build_new_name(raw_text, original, prefix_choice, custom_prefix, splitchar, sep, suffix_choice,
+                    custom_suffix, extension_choice):
+    body = _format_name_from_qr(raw_text, splitchar, sep)
     if not body:
         return ""
     stem, original_ext = os.path.splitext(original)
@@ -174,15 +184,16 @@ def _build_new_name(raw_text, original, prefix_choice, custom_prefix, sep, suffi
     return f"{name}{ext}"
 
 
-def update_filenames(df, raw_qr, prefix_choice, custom_prefix, sep_index, custom_sep,
-                     suffix_choice, custom_suffix, extension_choice):
+def update_filenames(df, raw_qr, prefix_choice, custom_prefix, split_index, custom_split,
+                     sep_index, custom_sep, suffix_choice, custom_suffix, extension_choice):
     """Rebuild the New filename column from the raw QR text and current settings."""
     if df is None or df.empty:
         return df
     raw_qr = raw_qr or {}
+    splitchar = _resolve_separator(split_index, custom_split, default=" ")
     sep = _resolve_separator(sep_index, custom_sep)
     df["New filename"] = [
-        _build_new_name(raw_qr.get(f, ""), f, prefix_choice, custom_prefix, sep,
+        _build_new_name(raw_qr.get(f, ""), f, prefix_choice, custom_prefix, splitchar, sep,
                         suffix_choice, custom_suffix, extension_choice)
         for f in df["Original filename"]
     ]
@@ -276,7 +287,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
     with gr.Row():
         gr.Markdown("# Breeding Insight QR Image Renamer ")
     with gr.Row(elem_classes="spaced"): # Instructions + upload section?
-        with gr.Column(scale=2):
+        with gr.Column(scale=3):
             upload = gr.File(
                 file_count="multiple",
                 file_types=["image"],
@@ -285,17 +296,19 @@ with gr.Blocks(title="QR Image Renamer") as demo:
             )
             upload_count = gr.Markdown("### 0 image(s) uploaded")
             run_btn = gr.Button("Start Detection", variant="primary")
-        with gr.Column(scale=5):
+            # Empty placeholder that hosts the detection progress bar
+            detect_progress = gr.Markdown("", min_height=120, elem_id="detect-progress")
+        with gr.Column(scale=7):
             gr.Markdown( 
                 """
                 ### INSTRUCTIONS
                 1. Select a set of images to upload and hit **Start Detection** to begin the
                 QR detection and reading process.
-                2. Choose your settings for how to construct filenames using the text scraped
+                2. Adjust your settings for how to construct filenames using the text scraped
                 from the detected QR code.
                 3. Use the filename table to make any manual corrections or additions to the
                 final filenames. To view an image, click anywhere on its corresponding row.
-                4. When ready, hit **Prepare Download** to generate a `.zip` of the renamed images,
+                4. When ready, hit **Prepare Download** to generate a .zip of the renamed images,
                 then hit **Download Renamed Images** to save them to your computer.
 
                 ### INFO
@@ -307,20 +320,45 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 it to fit your own program's needs, please visit the app's
                 [Github page](https://github.com/tyrwh/GRIN_image_renamer).
 
-                Any images uploaded here are saved to temporary storage on . All machine learning
-                steps are performed with a custom-trained QR code detection model; images are not
-                uploaded to any AI API 
-
+                *All data uploaded to the web version of this app is temporary.* Images and any associated data
+                are saved in temporary storage and deleted after one hour.
+                
                 For any questions or feedback,
                 please email me at [twiesnerhanks@ufl.edu](mailto:twiesnerhanks@ufl.edu).
+
+                Many thanks to Becky Povilus of the USDA-ARS for her help in creating and testing this app.
                 
                 """,
                 container=True
             )
 
-    with gr.Accordion(label="Settings", elem_classes="spaced"): # Settings dropdown
+    with gr.Accordion(label="Filename settings", elem_classes="spaced"): # Settings dropdown
         with gr.Row():
-            with gr.Column(scale=1):
+            with gr.Column(scale=0, min_width=270):
+                splitchar = gr.Radio(
+                    label="Split QR text on...",
+                    info="Character(s) to use when splitting the parsed text.",
+                    choices=[x["label"] for x in SEPARATORS],
+                    value=SEPARATORS[2]["label"],
+                    type="index",
+                    elem_classes="vertical-radio"
+                    )
+                custom_splitchar = gr.Textbox(visible=False,
+                                        label="Custom separator to use:")
+                splitchar.change(toggle_custom_sep, splitchar, custom_splitchar, show_progress="hidden")
+            with gr.Column(scale=0, min_width=270):
+                separator = gr.Radio(
+                    label="Rejoin QR text on...",
+                    info="Character(s) to use when rejoining the elements of the QR text.",
+                    choices=[x["label"] for x in SEPARATORS],
+                    value=SEPARATORS[0]["label"],
+                    type="index",
+                    elem_classes="vertical-radio"
+                    )
+                custom_sep = gr.Textbox(visible=False,
+                                        label="Custom separator to use:")
+                separator.change(toggle_custom_sep, separator, custom_sep, show_progress="hidden")
+            with gr.Column(scale=0, min_width=270):
                 prefix = gr.Radio(
                     choices=[
                         "None",
@@ -334,20 +372,9 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 )
                 custom_prefix = gr.Textbox(visible=False,
                                         label="Custom prefix to use:")
-                prefix.change(toggle_custom, prefix, custom_prefix)
-            with gr.Column(scale=1):
-                separator = gr.Radio(
-                    label="Separator",
-                    info="Character(s) to use when rejoining the elements of the QR text.",
-                    choices=[x["label"] for x in SEPARATORS],
-                    value=SEPARATORS[0]["label"],
-                    type="index",
-                    elem_classes="vertical-radio"
-                    )
-                custom_sep = gr.Textbox(visible=False,
-                                        label="Custom separator to use:")
-                separator.change(toggle_custom_sep, separator, custom_sep)
-            with gr.Column(scale=1):
+                prefix.change(toggle_custom, prefix, custom_prefix, show_progress="hidden")
+
+            with gr.Column(scale=0, min_width=270):
                 suffix = gr.Radio(
                     choices=[
                         "None",
@@ -356,13 +383,13 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                     ],
                     value="None",
                     label="Suffix",
-                    info="Append a suffix at the end of each filename.",
+                    info="Append a suffix to the end of each filename.",
                     elem_classes="vertical-radio"
                 )
                 custom_suffix = gr.Textbox(visible=False,
                                         label="Custom suffix to use:")
-                suffix.change(toggle_custom, suffix, custom_suffix)
-            with gr.Column(scale=1):
+                suffix.change(toggle_custom, suffix, custom_suffix, show_progress="hidden")
+            with gr.Column(scale=0, min_width=270):
                 extension = gr.Radio(
                     choices=[KEEP_EXTENSION] + EXTENSIONS,
                     value=KEEP_EXTENSION,
@@ -388,7 +415,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
             preview = gr.Image(label="Image preview", type="pil")
     with gr.Accordion(label="Download", elem_classes="spaced"): # Settings dropdown
         with gr.Row():
-            with gr.Column():                 
+            with gr.Column(scale=0, min_width=300):
                 include_unparsed = gr.Radio(
                     label="Unreadable QRs",
                     info="Should images with no detectable or readable QR code be included (with their original filename) in the final download?",
@@ -424,12 +451,13 @@ with gr.Blocks(title="QR Image Renamer") as demo:
         outputs=[preview],
     )
 
-    naming_inputs = [prefix, custom_prefix, separator, custom_sep, suffix, custom_suffix, extension]
+    naming_inputs = [prefix, custom_prefix, splitchar, custom_splitchar, separator, custom_sep, suffix, custom_suffix, extension]
 
     run_btn.click(
         fn=run_pipeline,
         inputs=[table] + naming_inputs,
         outputs=[table, raw_qr],
+        show_progress_on=detect_progress,
     )
 
     update_btn.click(
