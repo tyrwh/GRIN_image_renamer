@@ -6,6 +6,7 @@ import pyrxing
 import gradio as gr
 import pandas as pd
 import torch
+from fastapi import FastAPI
 from PIL import Image
 from ultralytics import YOLO
 
@@ -327,7 +328,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
     raw_qr = gr.State({})
     with gr.Row():
         gr.Markdown("# Breeding Insight QR Image Renamer ", elem_classes="app-title")
-    with gr.Row(elem_classes="spaced"): # Instructions + upload section?
+    with gr.Row(): # Instructions + upload section?
         with gr.Column(scale=3):
             upload = gr.File(
                 file_count="multiple",
@@ -355,7 +356,6 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 This app was created by [Breeding Insight](https://breedinginsight.org/),
                 a USDA-funded initiative based at University of Florida. It is licensed under the open-source
                 [Apache 2.0 License](https://www.apache.org/licenses/LICENSE-2.0.txt).
-
                 To run this app locally or on your own web server, or to fork the project to modify
                 it to fit your own program's needs, please visit the app's
                 [Github page](https://github.com/tyrwh/GRIN_image_renamer).
@@ -365,7 +365,6 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 
                 For any questions or feedback,
                 please email me at [twiesnerhanks@ufl.edu](mailto:twiesnerhanks@ufl.edu).
-
                 Many thanks to Becky Povilus of the USDA-ARS for her help in creating and testing this app.
                 
                 """,
@@ -515,10 +514,14 @@ with gr.Blocks(title="QR Image Renamer") as demo:
         outputs=[download_btn],
     )
 
+FONT_HEAD = '<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700&display=swap" rel="stylesheet">'
+
+# ASGI entry point for production servers, e.g. `hypercorn app:server`
+server = gr.mount_gradio_app(FastAPI(), demo, path="/", css=css, head=FONT_HEAD, theme=bi_theme)
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0",
-                server_port=7860,
+                server_port=8080,
                 css=css,
-                head='<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700&display=swap" rel="stylesheet">',
+                head=FONT_HEAD,
                 theme=bi_theme)
