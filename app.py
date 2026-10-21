@@ -24,7 +24,17 @@ css = """
 .label-wrap span { font-size: 1.8rem; }
 .spaced { margin-top: 2.5rem; }
 .large-label [data-testid="block-info"] { font-size: 1.5rem; }
-.info-pane { padding: 0.5rem 1.25rem; }
+.info-pane { padding: 1.5rem 1.25rem; }
+.app-title h1 {
+    font-family: "Montserrat", sans-serif;
+    font-weight: 700;
+    text-transform: uppercase;
+    font-size: 3rem;
+    color: #007680;
+}
+.padded-accordion { padding: 0.75rem; }
+.vertical-radio { --block-info-text-color: #52525b; }
+.vertical-radio [data-testid="block-info"] { color: #3f3f46; }
 .centered-row { justify-content: center; }
 #detect-progress .progress-bar-wrap { height: 1.5rem; }
 #detect-progress .progress-level-inner { margin: 0.75rem auto; }
@@ -37,11 +47,28 @@ css = """
 }
 """
 
+BI_TEAL = "#007680"
+BI_TEAL_HOVER = "#00646d"
+
 bi_theme = gr.themes.Default(
     font=gr.themes.GoogleFont("Lato"),
     primary_hue="teal",
     text_size="lg",
+    ).set(
+    body_background_fill="#f4f6f9",
+    button_primary_background_fill=BI_TEAL,
+    button_primary_background_fill_hover=BI_TEAL_HOVER,
+    button_primary_border_color=BI_TEAL,
+    button_primary_border_color_hover=BI_TEAL_HOVER,
+    button_primary_text_color="white",
     )
+# Gradio has no light-only option, so copy every light-mode theme value onto
+# its *_dark counterpart; dark mode then renders identically to light mode.
+bi_theme.set(**{
+    name: getattr(bi_theme, name.removesuffix("_dark"))
+    for name in vars(bi_theme)
+    if name.endswith("_dark")
+})
 
 # create a separator dictionary that we can reuse, instead of 
 SEPARATORS = [{"string":"_",
@@ -299,7 +326,7 @@ def download_renamed(df, include_mode, zip_name):
 with gr.Blocks(title="QR Image Renamer") as demo:
     raw_qr = gr.State({})
     with gr.Row():
-        gr.Markdown("# Breeding Insight QR Image Renamer ")
+        gr.Markdown("# Breeding Insight QR Image Renamer ", elem_classes="app-title")
     with gr.Row(elem_classes="spaced"): # Instructions + upload section?
         with gr.Column(scale=3):
             upload = gr.File(
@@ -333,8 +360,8 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 it to fit your own program's needs, please visit the app's
                 [Github page](https://github.com/tyrwh/GRIN_image_renamer).
 
-                *All data uploaded to the web version of this app is temporary.* Images and any associated data
-                are saved in temporary storage and deleted after one hour.
+                **All data uploaded to the web version of this app is temporary.** Images and any associated data
+                are saved in temporary storage and deleted after it has been dormant for one hour.
                 
                 For any questions or feedback,
                 please email me at [twiesnerhanks@ufl.edu](mailto:twiesnerhanks@ufl.edu).
@@ -346,7 +373,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 elem_classes="info-pane",
             )
 
-    with gr.Accordion(label="Filename settings", elem_classes="spaced"): # Settings dropdown
+    with gr.Accordion(label="Filename settings", elem_classes=["spaced", "padded-accordion"]): # Settings dropdown
         with gr.Row():
             with gr.Column(scale=0, min_width=270):
                 splitchar = gr.Radio(
@@ -414,7 +441,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
         with gr.Row(elem_classes="centered-row"):
             update_btn = gr.Button(
                 "Update filenames with current settings",
-                variant="secondary",
+                variant="primary",
                 scale=0,
                 min_width=600,
                 )
@@ -430,7 +457,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
         )
     with gr.Row(): # Image viewer
         preview = gr.Image(label="Image preview", type="pil", height=500)
-    with gr.Accordion(label="Download", elem_classes="spaced"): # Settings dropdown
+    with gr.Accordion(label="Download", elem_classes=["spaced", "padded-accordion"]): # Settings dropdown
         with gr.Row():
             with gr.Column(scale=0, min_width=400):
                 include_unparsed = gr.Radio(
@@ -452,8 +479,8 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                     elem_classes="large-label",
                 )
             with gr.Column():
-                prepare_btn = gr.Button("Prepare Download", variant="secondary")
-                download_btn = gr.DownloadButton("Download Renamed Images", visible=False)
+                prepare_btn = gr.Button("Prepare Download", variant="primary")
+                download_btn = gr.DownloadButton("Download Renamed Images", variant="primary", visible=False)
 
     upload.upload(
         fn=handle_upload,
@@ -491,6 +518,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0",
-                server_port=8080,
+                server_port=7860,
                 css=css,
+                head='<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700&display=swap" rel="stylesheet">',
                 theme=bi_theme)
