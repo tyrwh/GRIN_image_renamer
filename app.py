@@ -2,25 +2,30 @@ import os
 import tempfile
 import shutil
 import re
-import zxing
+import pyrxing
 import gradio as gr
 import pandas as pd
+import torch
 from PIL import Image
 from ultralytics import YOLO
 
 
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
 if gr.NO_RELOAD:
     MODEL = YOLO("qr_yolo26m_0.pt")
-    reader = zxing.BarCodeReader()
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix="grin_uploads_")
 
+# bunch of custom CSS to adjust UI appearance
 css = """
 .vertical-radio .wrap { flex-direction: column; }
 .vertical-radio [data-testid="block-info"] { font-size: 1.5rem; }
 .label-wrap span { font-size: 1.8rem; }
 .spaced { margin-top: 2.5rem; }
 .large-label [data-testid="block-info"] { font-size: 1.5rem; }
+.info-pane { padding: 0.5rem 1.25rem; }
+.centered-row { justify-content: center; }
 #detect-progress .progress-bar-wrap { height: 1.5rem; }
 #detect-progress .progress-level-inner { margin: 0.75rem auto; }
 #detect-progress .meta-text,
@@ -44,7 +49,7 @@ SEPARATORS = [{"string":"_",
                {"string":"-",
                "label":"Hyphen ( - )"},
                {"string":" ",
-               "label":"Space (   )"},
+               "label":"Space"},
                {"string":"",
                 "label":"None"},
                {"string":"custom",
@@ -53,6 +58,8 @@ SEPARATORS = [{"string":"_",
 KEEP_EXTENSION = "Keep existing extensions"
 EXTENSIONS = [".jpg", ".JPG", ".jpeg", ".JPEG", ".png", ".PNG"]
 PIL_FORMATS = {".jpg": "JPEG", ".jpeg": "JPEG", ".png": "PNG"}
+
+TABLE_COLUMNS = ["Original filename", "QRs\ndetected", "QRs\nparsed", "Parsed text", "New filename"]
 
 def toggle_custom(choice):
     return gr.Textbox(visible=(choice == "Custom"))
@@ -82,7 +89,7 @@ def _resolve_separator(index, custom_text, default="_"):
 
 def handle_upload(files):
     """Copy uploaded files to temp dir; return dataframe + first image preview."""
-    empty_df = pd.DataFrame(columns=["Original filename", "QRs\ndetected", "QRs\nparsed", "New filename"])
+    empty_df = pd.DataFrame(columns=TABLE_COLUMNS)
     if not files:
         return empty_df, None, None, "### 0 image(s) uploaded", {}
 
@@ -91,9 +98,10 @@ def handle_upload(files):
         basename = os.path.basename(f)
         dest = os.path.join(UPLOAD_DIR, basename)
         shutil.copy2(f, dest)
-        rows.append({"Original filename": basename, "QRs\ndetected": "", "QRs\nparsed": "", "New filename": ""})
+        rows.append({"Original filename": basename, "QRs\ndetected": "", "QRs\nparsed": "",
+                     "Parsed text": "", "New filename": ""})
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=TABLE_COLUMNS)
     first_image = Image.open(os.path.join(UPLOAD_DIR, df.iloc[0]["Original filename"]))
     count_text = f"### {len(df)} image(s) uploaded"
     return df, first_image, None, count_text, {}
@@ -125,21 +133,25 @@ def run_pipeline(df, prefix_choice, custom_prefix, split_index, custom_split, se
     for i, filename in progress.tqdm(enumerate(filenames), total=len(filenames), desc="Running detection"):
         path = os.path.join(UPLOAD_DIR, filename)
         img =  Image.open(path)
-        r = MODEL(img, imgsz=640, conf=0.7, verbose=False)[0]
+        r = MODEL(img, imgsz=640, conf=0.7, device=DEVICE, verbose=False)[0]
         count = 0
         parse_count = 0
         parser_results = []
         for box in r.boxes:
             if r.names[int(box.cls)] == "aztec_code":
                 count += 1
-                # try parsing the QR
-                pad = 10
-                x1,y1,x2,y2 = list(box.xyxy.numpy()[0])
+                # try parsing the QR, 40px pad usually more than enough
+                pad = 40
+                x1,y1,x2,y2 = list(box.xyxy.cpu().numpy()[0])
                 qr_crop = img.crop((x1-pad,y1-pad,x2+pad,y2+pad))
-                zxing_results = reader.decode(qr_crop)
-                if zxing_results and zxing_results.parsed:
+                rxing_result = pyrxing.read_barcode(qr_crop)
+                if not rxing_result:
+                    # retry on a 2x upscale in case code is small/blurry
+                    qr_crop = qr_crop.resize((qr_crop.width * 2, qr_crop.height * 2), Image.LANCZOS)
+                    rxing_result = pyrxing.read_barcode(qr_crop)
+                if rxing_result and rxing_result.text:
                     parse_count += 1
-                    parser_results.append(zxing_results.parsed)
+                    parser_results.append(rxing_result.text)
         if len(parser_results) > 0:
             text = max(parser_results, key=len)
         else:
@@ -149,10 +161,12 @@ def run_pipeline(df, prefix_choice, custom_prefix, split_index, custom_split, se
         parsed_text.append(text)
     df["QRs\ndetected"] = qr_counts
     df["QRs\nparsed"] = parsed_qr_counts
+    # Only show the parsed text when it's unambiguous (exactly one QR read).
+    df["Parsed text"] = [t if n == 1 else "" for t, n in zip(parsed_text, parsed_qr_counts)]
     raw_qr = dict(zip(filenames, parsed_text))
     df = update_filenames(df, raw_qr, prefix_choice, custom_prefix, split_index, custom_split,
                           sep_index, custom_sep, suffix_choice, custom_suffix, extension_choice)
-    gr.Info("Pipeline finished!")
+    gr.Info("Detection finished!")
     return df, raw_qr
 
 
@@ -302,10 +316,9 @@ with gr.Blocks(title="QR Image Renamer") as demo:
             gr.Markdown( 
                 """
                 ### INSTRUCTIONS
-                1. Select a set of images to upload and hit **Start Detection** to begin the
+                1. Upload your image(s) at left and hit **Start Detection** to begin the
                 QR detection and reading process.
-                2. Adjust your settings for how to construct filenames using the text scraped
-                from the detected QR code.
+                2. Adjust your settings to tell the app how to construct file names .
                 3. Use the filename table to make any manual corrections or additions to the
                 final filenames. To view an image, click anywhere on its corresponding row.
                 4. When ready, hit **Prepare Download** to generate a .zip of the renamed images,
@@ -329,7 +342,8 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 Many thanks to Becky Povilus of the USDA-ARS for her help in creating and testing this app.
                 
                 """,
-                container=True
+                container=True,
+                elem_classes="info-pane",
             )
 
     with gr.Accordion(label="Filename settings", elem_classes="spaced"): # Settings dropdown
@@ -397,25 +411,28 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                     info="Filename extension to apply to all images.",
                     elem_classes="vertical-radio",
                 )
-        with gr.Row():
+        with gr.Row(elem_classes="centered-row"):
             update_btn = gr.Button(
                 "Update filenames with current settings",
                 variant="secondary",
+                scale=0,
+                min_width=600,
                 )
-    with gr.Row(max_height=600, elem_classes="spaced"): # Table and image viewer
-        with gr.Column(scale=3):
-            table = gr.Dataframe(
-                headers=["Original filename", "QRs detected", "QRs parsed", "New filename"],
-                datatype=["str", "number", "number", "str"],
-                interactive=True,
-                max_height=550,
-                column_widths=["40%","10%","10%","40%"]
-            )
-        with gr.Column(scale=2):
-            preview = gr.Image(label="Image preview", type="pil")
+    with gr.Row(elem_classes="spaced"): # Results table
+        table = gr.Dataframe(
+            headers=TABLE_COLUMNS,
+            datatype=["str", "number", "number", "str", "str"],
+            interactive=True,
+            max_height=550,
+            column_widths=["30%", "8%", "8%", "24%", "30%"],
+            static_columns=[0, 1, 2, 3],
+            row_count=(0, "fixed"),  # rows come only from uploads; hides the add-row controls
+        )
+    with gr.Row(): # Image viewer
+        preview = gr.Image(label="Image preview", type="pil", height=500)
     with gr.Accordion(label="Download", elem_classes="spaced"): # Settings dropdown
         with gr.Row():
-            with gr.Column(scale=0, min_width=300):
+            with gr.Column(scale=0, min_width=400):
                 include_unparsed = gr.Radio(
                     label="Unreadable QRs",
                     info="Should images with no detectable or readable QR code be included (with their original filename) in the final download?",
@@ -438,7 +455,6 @@ with gr.Blocks(title="QR Image Renamer") as demo:
                 prepare_btn = gr.Button("Prepare Download", variant="secondary")
                 download_btn = gr.DownloadButton("Download Renamed Images", visible=False)
 
-    # --- wiring ---
     upload.upload(
         fn=handle_upload,
         inputs=[upload],
