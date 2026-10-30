@@ -4,3 +4,4 @@ Pillow==12.3.0
 ultralytics==8.4.33
 pyrxing==0.8.0
 hypercorn==0.18.0
+psutil==7.1.3
