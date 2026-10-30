@@ -2,21 +2,38 @@ import os
 import tempfile
 import shutil
 import re
+import time
+import logging
 import pyrxing
 import gradio as gr
 import pandas as pd
+import psutil
 import torch
 from fastapi import FastAPI
-from PIL import Image
+from PIL import Image, ImageOps
 from ultralytics import YOLO
 
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("grin")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # hide Gradio's telemetry/version-check requests
+
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+# Startup diagnostics: confirm GPU use and CPU thread counts in the Cloud Run logs
+log.info("torch %s | CUDA build %s | cuda available %s | device %s%s",
+         torch.__version__, torch.version.cuda, torch.cuda.is_available(), DEVICE,
+         f" ({torch.cuda.get_device_name(0)})" if DEVICE.startswith("cuda") else "")
+log.info("torch threads %d | os.cpu_count %s | usable CPUs %s",
+         torch.get_num_threads(), os.cpu_count(),
+         len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else "n/a")
 
 if gr.NO_RELOAD:
     MODEL = YOLO("qr_yolo26m_0.pt")
 
 UPLOAD_DIR = tempfile.mkdtemp(prefix="grin_uploads_")
+PREVIEW_DIR = tempfile.mkdtemp(prefix="grin_previews_")
+PREVIEW_MAX_SIZE = 1280
 
 # bunch of custom CSS to adjust UI appearance
 css = """
@@ -115,6 +132,19 @@ def _resolve_separator(index, custom_text, default="_"):
     return entry["string"]
 
 
+def _preview_path(filename):
+    """Return a cached, downsized JPEG preview of an uploaded image, creating it on first use."""
+    preview = os.path.join(PREVIEW_DIR, f"{filename}.jpg")
+    if not os.path.exists(preview):
+        with Image.open(os.path.join(UPLOAD_DIR, filename)) as img:
+            # draft() lets JPEGs decode directly at reduced scale, which is much faster
+            img.draft("RGB", (PREVIEW_MAX_SIZE, PREVIEW_MAX_SIZE))
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img.thumbnail((PREVIEW_MAX_SIZE, PREVIEW_MAX_SIZE))
+            img.save(preview, "JPEG", quality=85)
+    return preview
+
+
 def handle_upload(files):
     """Copy uploaded files to temp dir; return dataframe + first image preview."""
     empty_df = pd.DataFrame(columns=TABLE_COLUMNS)
@@ -126,11 +156,15 @@ def handle_upload(files):
         basename = os.path.basename(f)
         dest = os.path.join(UPLOAD_DIR, basename)
         shutil.copy2(f, dest)
+        # drop any stale preview from an earlier upload with the same filename
+        stale_preview = os.path.join(PREVIEW_DIR, f"{basename}.jpg")
+        if os.path.exists(stale_preview):
+            os.remove(stale_preview)
         rows.append({"Original filename": basename, "QRs\ndetected": "", "QRs\nparsed": "",
                      "Parsed text": "", "New filename": ""})
 
     df = pd.DataFrame(rows, columns=TABLE_COLUMNS)
-    first_image = Image.open(os.path.join(UPLOAD_DIR, df.iloc[0]["Original filename"]))
+    first_image = _preview_path(df.iloc[0]["Original filename"])
     count_text = f"### {len(df)} image(s) uploaded"
     return df, first_image, None, count_text, {}
 
@@ -141,9 +175,8 @@ def preview_selected(evt: gr.SelectData, df):
         return None
     row_idx = evt.index[0]
     filename = df.iloc[row_idx]["Original filename"]
-    path = os.path.join(UPLOAD_DIR, filename)
-    if os.path.exists(path):
-        return Image.open(path)
+    if os.path.exists(os.path.join(UPLOAD_DIR, filename)):
+        return _preview_path(filename)
     return None
 
 
@@ -158,28 +191,44 @@ def run_pipeline(df, prefix_choice, custom_prefix, split_index, custom_split, se
     qr_counts = []
     parsed_qr_counts = []
     parsed_text = []
+    run_start = time.perf_counter()
     for i, filename in progress.tqdm(enumerate(filenames), total=len(filenames), desc="Running detection"):
         path = os.path.join(UPLOAD_DIR, filename)
-        img =  Image.open(path)
-        r = MODEL(img, imgsz=640, conf=0.7, device=DEVICE, verbose=False)[0]
-        count = 0
-        parse_count = 0
-        parser_results = []
-        for box in r.boxes:
-            if r.names[int(box.cls)] == "aztec_code":
-                count += 1
-                # try parsing the QR, 40px pad usually more than enough
-                pad = 40
-                x1,y1,x2,y2 = list(box.xyxy.cpu().numpy()[0])
-                qr_crop = img.crop((x1-pad,y1-pad,x2+pad,y2+pad))
-                rxing_result = pyrxing.read_barcode(qr_crop)
-                if not rxing_result:
-                    # retry on a 2x upscale in case code is small/blurry
-                    qr_crop = qr_crop.resize((qr_crop.width * 2, qr_crop.height * 2), Image.LANCZOS)
+        t0 = time.perf_counter()
+        with Image.open(path) as img:
+            img.load()  # force the JPEG decode here so it's timed separately from the model
+            t_open = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            r = MODEL(img, imgsz=640, conf=0.7, device=DEVICE, verbose=False)[0]
+            t_model = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            retries = 0
+            count = 0
+            parse_count = 0
+            parser_results = []
+            for box in r.boxes:
+                if r.names[int(box.cls)] == "aztec_code":
+                    count += 1
+                    # try parsing the QR, 40px pad usually more than enough
+                    pad = 40
+                    x1,y1,x2,y2 = list(box.xyxy.cpu().numpy()[0])
+                    qr_crop = img.crop((x1-pad,y1-pad,x2+pad,y2+pad))
                     rxing_result = pyrxing.read_barcode(qr_crop)
-                if rxing_result and rxing_result.text:
-                    parse_count += 1
-                    parser_results.append(rxing_result.text)
+                    if not rxing_result:
+                        retries += 1
+                        # retry on a 2x upscale in case code is small/blurry
+                        qr_crop = qr_crop.resize((qr_crop.width * 2, qr_crop.height * 2), Image.LANCZOS)
+                        rxing_result = pyrxing.read_barcode(qr_crop)
+                    if rxing_result and rxing_result.text:
+                        parse_count += 1
+                        parser_results.append(rxing_result.text)
+            t_decode = time.perf_counter() - t0
+        # r.speed is ultralytics' own split, in ms
+        log.info("%s | %dx%d | open %.0fms | model %.0fms (pre %.0f, infer %.0f, post %.0f) "
+                 "| decode %.0fms (%d codes, %d retries)",
+                 filename, img.width, img.height, t_open * 1000, t_model * 1000,
+                 r.speed["preprocess"], r.speed["inference"], r.speed["postprocess"],
+                 t_decode * 1000, count, retries)
         if len(parser_results) > 0:
             text = max(parser_results, key=len)
         else:
@@ -187,6 +236,7 @@ def run_pipeline(df, prefix_choice, custom_prefix, split_index, custom_split, se
         qr_counts.append(count)
         parsed_qr_counts.append(parse_count)
         parsed_text.append(text)
+    log.info("Detection run: %d images in %.1fs on %s", len(filenames), time.perf_counter() - run_start, DEVICE)
     df["QRs\ndetected"] = qr_counts
     df["QRs\nparsed"] = parsed_qr_counts
     # Only show the parsed text when it's unambiguous (exactly one QR read).
@@ -324,6 +374,52 @@ def download_renamed(df, include_mode, zip_name):
     return gr.update(value=zip_path, visible=True)
 
 
+def _read_cgroup_file(*paths):
+    """Return the first readable cgroup value, or None (no cgroup, or no limit set)."""
+    for path in paths:
+        try:
+            with open(path) as f:
+                value = f.read().strip()
+        except OSError:
+            continue
+        if value.isdigit():
+            return int(value)
+    return None
+
+
+def _available_cores():
+    """CPU cores the app may use: the affinity mask, capped by any container CPU quota."""
+    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota, period = f.read().split()
+        if quota != "max":
+            cores = min(cores, max(1, round(int(quota) / int(period))))
+    except (OSError, ValueError):
+        pass
+    return cores
+
+
+def _available_memory_bytes():
+    """Physical memory, capped by any container memory limit."""
+    total = psutil.virtual_memory().total
+    limit = _read_cgroup_file("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    return min(total, limit) if limit else total
+
+
+def show_system_info():
+    """Pop up a toast with the resources the app can use; Gradio auto-dismisses it after 10 seconds."""
+    memory_gb = _available_memory_bytes() / 1024 ** 3
+    gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "not detected"
+    gr.Info(
+        f"CPU cores available: {_available_cores()} | "
+        f"Memory available: {memory_gb:.1f} GB | "
+        f"CUDA GPU: {gpu}",
+        title="System resources",
+        duration=10,
+    )
+
+
 with gr.Blocks(title="QR Image Renamer") as demo:
     raw_qr = gr.State({})
     with gr.Row():
@@ -455,7 +551,7 @@ with gr.Blocks(title="QR Image Renamer") as demo:
             row_count=(0, "fixed"),  # rows come only from uploads; hides the add-row controls
         )
     with gr.Row(): # Image viewer
-        preview = gr.Image(label="Image preview", type="pil", height=500)
+        preview = gr.Image(label="Image preview", type="filepath", height=800)
     with gr.Accordion(label="Download", elem_classes=["spaced", "padded-accordion"]): # Settings dropdown
         with gr.Row():
             with gr.Column(scale=0, min_width=400):
@@ -513,6 +609,8 @@ with gr.Blocks(title="QR Image Renamer") as demo:
         inputs=[table, include_unparsed, download_zip_name],
         outputs=[download_btn],
     )
+
+    demo.load(fn=show_system_info, inputs=None, outputs=None)
 
 FONT_HEAD = '<link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@700&display=swap" rel="stylesheet">'
 
